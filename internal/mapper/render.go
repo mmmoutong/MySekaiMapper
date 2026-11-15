@@ -143,7 +143,7 @@ func renderSite(drops []Drop, siteID int, resources map[int]Resource, face, coun
 	}
 
 	canvas := image.NewRGBA(image.Rect(0, 0, canvasWidth, canvasHeight))
-	drawMapCard(canvas, drops, groups, labels, siteID, resources, face, countFace)
+	drawMapCard(canvas, siteID, face, countFace)
 
 	// Draw connections before any labels, so even crossing lines cannot erase
 	// an icon or its quantity. Displaced labels retain their actual map anchor.

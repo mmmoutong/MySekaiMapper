@@ -22,10 +22,10 @@ import (
 const (
 	canvasWidth  = 1800
 	canvasHeight = 1800
-	plotLeft     = 120
-	plotRight    = canvasWidth - 60
-	plotTop      = 115
-	plotBottom   = canvasHeight - 130
+	plotLeft     = 84
+	plotRight    = canvasWidth - 84
+	plotTop      = 206
+	plotBottom   = 1628
 	iconSize     = 42
 	iconStep     = 42
 )
@@ -143,15 +143,7 @@ func renderSite(drops []Drop, siteID int, resources map[int]Resource, face, coun
 	}
 
 	canvas := image.NewRGBA(image.Rect(0, 0, canvasWidth, canvasHeight))
-	stdDraw.Draw(canvas, canvas.Bounds(), image.NewUniform(color.White), image.Point{}, stdDraw.Src)
-	strokeRect(canvas, image.Rect(plotLeft, plotTop, plotRight, plotBottom), color.Black)
-
-	title := fmt.Sprintf("Harvest Drops — Site %d", siteID)
-	drawText(canvas, face, plotLeft+(plotRight-plotLeft)/2-len(title)*9, 64, title)
-	drawText(canvas, countFace, plotLeft, 96, "Common wood and stone are included in totals, but hidden on the map.")
-	drawText(canvas, face, plotLeft, canvasHeight-55, "positionX")
-	drawText(canvas, face, 20, plotTop+25, "positionZ")
-	drawText(canvas, face, plotLeft, canvasHeight-15, "I: item   F: furniture   R: music record   M: unknown material")
+	drawMapCard(canvas, drops, groups, labels, siteID, resources, face, countFace)
 
 	// Draw connections before any labels, so even crossing lines cannot erase
 	// an icon or its quantity. Displaced labels retain their actual map anchor.
@@ -162,7 +154,7 @@ func renderSite(drops []Drop, siteID int, resources map[int]Resource, face, coun
 				max(label.rect.Min.Y, min(label.anchor.Y, label.rect.Max.Y-1)),
 			)
 			drawMapConnection(canvas, label.anchor, end)
-			stdDraw.Draw(canvas, image.Rect(label.anchor.X-2, label.anchor.Y-2, label.anchor.X+3, label.anchor.Y+3), image.NewUniform(color.RGBA{90, 90, 90, 255}), image.Point{}, stdDraw.Src)
+			fillRoundedRect(canvas, image.Rect(label.anchor.X-3, label.anchor.Y-3, label.anchor.X+3, label.anchor.Y+3), 3, mapMuted)
 		}
 	}
 	for _, label := range labels {
@@ -173,7 +165,7 @@ func renderSite(drops []Drop, siteID int, resources map[int]Resource, face, coun
 			if key.Type == mysekaiMaterialType && ok && resource.Image != nil {
 				pasteScaled(canvas, resource.Image, x, y, iconSize)
 			} else {
-				drawResourceBadge(canvas, key, x, y)
+				drawResourceBadge(canvas, key, x, y, countFace)
 			}
 			count := label.group.resources[key]
 			if count > 1 {
@@ -196,7 +188,7 @@ func drawMapConnection(canvas *image.RGBA, from, to image.Point) {
 		if steps > 0 {
 			point = image.Pt(from.X+dx*i/steps, from.Y+dy*i/steps)
 		}
-		canvas.Set(point.X, point.Y, color.RGBA{145, 145, 145, 255})
+		canvas.Set(point.X, point.Y, color.RGBA{178, 190, 206, 255})
 	}
 }
 
@@ -209,7 +201,7 @@ func absInt(value int) int {
 
 // The CSV contains MySekai material icons only. A type-specific badge keeps
 // items, furniture and records visible without borrowing a material's icon.
-func drawResourceBadge(canvas *image.RGBA, key resourceKey, x, y int) {
+func drawResourceBadge(canvas *image.RGBA, key resourceKey, x, y int, faces ...font.Face) {
 	label := "?"
 	background := color.RGBA{235, 235, 235, 255}
 	switch key.Type {
@@ -226,11 +218,14 @@ func drawResourceBadge(canvas *image.RGBA, key resourceKey, x, y int) {
 		background = color.RGBA{238, 224, 255, 255}
 	}
 	rect := image.Rect(x, y, x+iconSize, y+iconSize)
-	stdDraw.Draw(canvas, rect, image.NewUniform(background), image.Point{}, stdDraw.Src)
-	strokeRect(canvas, rect, color.RGBA{110, 110, 110, 255})
+	fillRoundedRect(canvas, rect, 8, background)
 	id := fmt.Sprint(key.ID)
-	drawText(canvas, basicfont.Face7x13, x+(iconSize-7)/2, y+15, label)
-	drawText(canvas, basicfont.Face7x13, x+(iconSize-len(id)*7)/2, y+33, id)
+	drawTextColor(canvas, basicfont.Face7x13, x+(iconSize-7)/2, y+14, label, mapMuted)
+	var idFace font.Face = basicfont.Face7x13
+	if len(faces) > 0 && font.MeasureString(faces[0], id).Ceil() <= iconSize-8 {
+		idFace = faces[0]
+	}
+	drawText(canvas, idFace, x+(iconSize-font.MeasureString(idFace, id).Ceil())/2, y+34, id)
 }
 
 func writePNGAtomically(path string, source image.Image) error {
@@ -281,21 +276,14 @@ func pasteScaled(dst *image.RGBA, src image.Image, x, y, size int) {
 	stdDraw.Draw(dst, image.Rect(x, y, x+size, y+size), thumb, image.Point{}, stdDraw.Over)
 }
 
-func strokeRect(dst *image.RGBA, rect image.Rectangle, c color.Color) {
-	for x := rect.Min.X; x < rect.Max.X; x++ {
-		dst.Set(x, rect.Min.Y, c)
-		dst.Set(x, rect.Max.Y-1, c)
-	}
-	for y := rect.Min.Y; y < rect.Max.Y; y++ {
-		dst.Set(rect.Min.X, y, c)
-		dst.Set(rect.Max.X-1, y, c)
-	}
+func drawText(dst *image.RGBA, face font.Face, x, y int, value string) {
+	drawTextColor(dst, face, x, y, value, mapInk)
 }
 
-func drawText(dst *image.RGBA, face font.Face, x, y int, value string) {
+func drawTextColor(dst *image.RGBA, face font.Face, x, y int, value string, ink color.Color) {
 	drawer := &font.Drawer{
 		Dst:  dst,
-		Src:  image.NewUniform(color.Black),
+		Src:  image.NewUniform(ink),
 		Face: face,
 		Dot:  fixed.P(x, y),
 	}

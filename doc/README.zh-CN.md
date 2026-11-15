@@ -25,7 +25,8 @@ mysekaimapper serve
     ├─ 归档到 data/archive/by-id/<player_id>/<timestamp>/
     └─ 发布 data/latest/ 并通知
          ├─ Telegram：以 multipart 媒体组上传本地图片
-         └─ Bark：从公开静态文件服务器读取图片 URL
+         ├─ Bark：从公开静态文件服务器读取图片 URL
+         └─ AstrBot（QQ）：通过 Push Lite 提交文字和 Base64 图片
 ```
 
 ## 快速上手
@@ -34,6 +35,7 @@ mysekaimapper serve
 
 - **路径 A — 仅使用 Telegram**：最简单的选项；不需要玩家路由文件或公开图片服务器。
 - **路径 B — 启用 Bark**：配置 Bark 密钥、玩家路由以及用于图片的公开静态文件服务器。
+- **路径 C — AstrBot（QQ）**：按下方第 5 步配置 Push Lite 和接收人别名，无需公开图片服务器。
 
 ### 1. 前置条件与构建
 
@@ -111,6 +113,47 @@ go build -o bin/mysekaimapper ./cmd/mysekaimapper
    ```
 
 未配置的玩家默认使用 Telegram。因此，如果没有配置 Telegram，未配置的玩家不会收到通知；仅使用 Bark 时，请为玩家显式分配 Bark 别名。
+
+### 5. 路径 C — AstrBot（QQ）
+
+完成第 1–2 步后，直接配置 AstrBot；Telegram 和 Bark 均为可选：
+
+1. 在 AstrBot 中安装 `astrbot_plugin_push_lite`，通过 OneBot v11 接入 QQ，并配置插件的 API token 和监听端口（默认 `9966`）。
+2. 在 `.env` 中配置推送服务（HTTP 仅适用于可信本机或 Docker 私有网络）：
+
+   ```dotenv
+   ASTRBOT_PUSH_URL=http://astrbot:9966
+   ASTRBOT_PUSH_TOKEN=your-plugin-api-token
+   ASTRBOT_ALLOW_INSECURE_HTTP=1
+   ```
+
+   地址须能从 MySekaiMapper 访问，末尾不要加 `/send`。使用 HTTPS 时保持 `ASTRBOT_ALLOW_INSECURE_HTTP=0`。
+
+3. 从 `config/astrbot_map.example.json` 创建 `config/astrbot_map.json`，配置接收人：
+
+   ```json
+   {
+     "qq_me": {"platform_id": "qq_main", "type": "private", "qq": "123456789"}
+   }
+   ```
+
+   将 `qq_main` 替换为 AstrBot 实际的平台实例 ID（可通过 `/sid` 确认），`qq` 用字符串填写接收人的 QQ 号。群聊则将 `type` 改为 `group`，并填写群号。
+
+4. 创建或更新 `config/push_map.json`，将实际游戏玩家 ID 映射到接收人别名：
+
+   ```json
+   {
+     "1234567890123456789": ["astrbot:qq_me"]
+   }
+   ```
+
+5. 启动服务：
+
+   ```bash
+   bin/mysekaimapper serve --host 0.0.0.0 --port 9478
+   ```
+
+无需公开图片服务器或共享目录。没有显式配置路由的玩家仍默认走 Telegram。Push Lite 成功响应仅代表请求已入队，QQ 送达结果请查看 AstrBot 日志。完整说明见下方“通知与静态文件”中的 AstrBot 章节。
 
 ## 运行服务
 

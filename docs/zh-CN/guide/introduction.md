@@ -27,5 +27,6 @@ mysekaimapper serve
     ├─ 归档到 data/archive/by-id/<player_id>/<timestamp>/
     └─ 发布 data/latest/ 并通知
          ├─ Telegram：以 multipart 媒体组上传本地图片
-         └─ Bark：从公开静态文件服务器读取图片 URL
+         ├─ Bark：从公开静态文件服务器读取图片 URL
+         └─ AstrBot（QQ）：通过 Push Lite 提交文字和 Base64 图片
 ```

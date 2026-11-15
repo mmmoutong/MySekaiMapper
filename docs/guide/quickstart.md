@@ -6,7 +6,7 @@ Choose the notification path that fits your setup:
 
 - **Path A — Telegram only**: simplest option; no player-routing file or public image server is needed.
 - **Path B — Bark enabled**: configure Bark keys, player routing, and a public static-file server for images.
-- **Path C — AstrBot (QQ)**: configure Push Lite and recipient aliases; see the AstrBot section under Notifications and static files. No public image server is needed.
+- **Path C — AstrBot (QQ)**: configure Push Lite and recipient aliases using step 5 below. No public image server is needed.
 
 ### 1. Requirements and build
 
@@ -84,3 +84,44 @@ In addition to the Path A configuration (Telegram may be omitted for Bark-only r
    ```
 
 An unconfigured player defaults to Telegram. If Telegram is not configured, an unconfigured player therefore receives no notification; explicitly assign a Bark alias for Bark-only use.
+
+### 5. Path C — AstrBot (QQ)
+
+After completing steps 1–2, configure AstrBot directly; Telegram and Bark are optional:
+
+1. Install `astrbot_plugin_push_lite` in your AstrBot instance, connect QQ through OneBot v11, and configure the plugin's API token and listening port (default `9966`).
+2. Set the gateway in `.env` (use HTTP only on a trusted local/Docker network):
+
+   ```dotenv
+   ASTRBOT_PUSH_URL=http://astrbot:9966
+   ASTRBOT_PUSH_TOKEN=your-plugin-api-token
+   ASTRBOT_ALLOW_INSECURE_HTTP=1
+   ```
+
+   Use an address reachable from MySekaiMapper; omit `/send`. For HTTPS, keep `ASTRBOT_ALLOW_INSECURE_HTTP=0`.
+
+3. Create `config/astrbot_map.json` from `config/astrbot_map.example.json` and configure a recipient:
+
+   ```json
+   {
+     "qq_me": {"platform_id": "qq_main", "type": "private", "qq": "123456789"}
+   }
+   ```
+
+   Replace `qq_main` with the actual AstrBot platform instance ID (confirm it with `/sid`), and use the recipient's QQ number as a string. For a group, use `"type": "group"` and the group number.
+
+4. Create or update `config/push_map.json`, assigning your actual game player ID to the recipient alias:
+
+   ```json
+   {
+     "1234567890123456789": ["astrbot:qq_me"]
+   }
+   ```
+
+5. Start the service:
+
+   ```bash
+   bin/mysekaimapper serve --host 0.0.0.0 --port 9478
+   ```
+
+No public image server or shared directory is needed. Players without an explicit route still default to Telegram. A successful Push Lite response means the request is queued; check AstrBot logs for QQ delivery. See the AstrBot section under Notifications and static files for full details.

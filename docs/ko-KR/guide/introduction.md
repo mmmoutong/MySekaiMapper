@@ -27,5 +27,6 @@ mysekaimapper serve
     ├─ archive data/archive/by-id/<player_id>/<timestamp>/
     └─ publish data/latest/ and notify
          ├─ Telegram: upload local images as multipart media groups
-         └─ Bark: send image URLs from a public static-file server
+         ├─ Bark: send image URLs from a public static-file server
+         └─ AstrBot (QQ): submit text and Base64 images through Push Lite
 ```

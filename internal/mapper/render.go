@@ -7,7 +7,6 @@ import (
 	stdDraw "image/draw"
 	"image/png"
 	"io"
-	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -32,9 +31,9 @@ const (
 )
 
 var (
-	ignoreCountIDs = map[int]struct{}{1: {}, 6: {}}
-	rareIDs        = []int{5, 12, 20, 24}
-	siteNames      = map[int]string{5: "初始空地", 6: "心愿沙滩", 7: "烂漫花田", 8: "忘却之所"}
+	hiddenMapMaterialIDs = map[int]struct{}{1: {}, 6: {}}
+	rareIDs              = []int{5, 12, 20, 24}
+	siteNames            = map[int]string{5: "初始空地", 6: "心愿沙滩", 7: "烂漫花田", 8: "忘却之所"}
 )
 
 // GenerateResult describes generated artifacts without retaining plaintext or
@@ -138,20 +137,9 @@ func renderSite(drops []Drop, siteID int, resources map[int]Resource, face, coun
 		return fmt.Errorf("site %d has no drops", siteID)
 	}
 
-	minX, maxX := math.Inf(1), math.Inf(-1)
-	minZ, maxZ := math.Inf(1), math.Inf(-1)
-	for _, group := range groups {
-		x, z := Rotate(group.x, group.z, siteID)
-		minX, maxX = math.Min(minX, x), math.Max(maxX, x)
-		minZ, maxZ = math.Min(minZ, z), math.Max(maxZ, z)
-	}
-	minX, maxX = minX-2, maxX+2
-	minZ, maxZ = minZ-2, maxZ+2
-	if maxX-minX < 1 {
-		maxX = minX + 1
-	}
-	if maxZ-minZ < 1 {
-		maxZ = minZ + 1
+	labels, err := layoutSiteLabels(groups, siteID, countFace)
+	if err != nil {
+		return fmt.Errorf("layout site %d: %w", siteID, err)
 	}
 
 	canvas := image.NewRGBA(image.Rect(0, 0, canvasWidth, canvasHeight))
@@ -160,59 +148,36 @@ func renderSite(drops []Drop, siteID int, resources map[int]Resource, face, coun
 
 	title := fmt.Sprintf("Harvest Drops — Site %d", siteID)
 	drawText(canvas, face, plotLeft+(plotRight-plotLeft)/2-len(title)*9, 64, title)
+	drawText(canvas, countFace, plotLeft, 96, "Common wood and stone are included in totals, but hidden on the map.")
 	drawText(canvas, face, plotLeft, canvasHeight-55, "positionX")
 	drawText(canvas, face, 20, plotTop+25, "positionZ")
 	drawText(canvas, face, plotLeft, canvasHeight-15, "I: item   F: furniture   R: music record   M: unknown material")
 
-	toX := func(x float64) int {
-		left, right := plotLeft+iconSize/2, plotRight-iconSize/2-90
-		return left + int(math.Round((x-minX)/(maxX-minX)*float64(right-left)))
-	}
-	maxStack := 1
-	for _, group := range groups {
-		if len(group.resources) > maxStack {
-			maxStack = len(group.resources)
+	// Draw connections before any labels, so even crossing lines cannot erase
+	// an icon or its quantity. Displaced labels retain their actual map anchor.
+	for _, label := range labels {
+		if !label.anchor.In(label.rect) {
+			end := image.Pt(
+				max(label.rect.Min.X, min(label.anchor.X, label.rect.Max.X-1)),
+				max(label.rect.Min.Y, min(label.anchor.Y, label.rect.Max.Y-1)),
+			)
+			drawMapConnection(canvas, label.anchor, end)
+			stdDraw.Draw(canvas, image.Rect(label.anchor.X-2, label.anchor.Y-2, label.anchor.X+3, label.anchor.Y+3), image.NewUniform(color.RGBA{90, 90, 90, 255}), image.Point{}, stdDraw.Src)
 		}
 	}
-	toY := func(z float64) int {
-		top, bottom := plotTop+iconSize/2, plotBottom-iconSize/2-(maxStack-1)*iconStep
-		return top + int(math.Round((maxZ-z)/(maxZ-minZ)*float64(bottom-top)))
-	}
-
-	for _, group := range groups {
-		x, z := Rotate(group.x, group.z, siteID)
-		px, py := toX(x), toY(z)
-		keys := make([]resourceKey, 0, len(group.resources))
-		for key := range group.resources {
-			keys = append(keys, key)
-		}
-		sort.Slice(keys, func(i, j int) bool {
-			if keys[i].Type == keys[j].Type {
-				return keys[i].ID < keys[j].ID
-			}
-			// Keep material icons first, followed by the other resource types.
-			if keys[i].Type == mysekaiMaterialType {
-				return true
-			}
-			if keys[j].Type == mysekaiMaterialType {
-				return false
-			}
-			return keys[i].Type < keys[j].Type
-		})
-		for index, key := range keys {
+	for _, label := range labels {
+		for index, key := range label.keys {
 			offset := index * iconStep
+			x, y := label.rect.Min.X, label.rect.Min.Y+offset
 			resource, ok := resources[key.ID]
 			if key.Type == mysekaiMaterialType && ok && resource.Image != nil {
-				pasteScaled(canvas, resource.Image, px-iconSize/2, py-iconSize/2+offset, iconSize)
+				pasteScaled(canvas, resource.Image, x, y, iconSize)
 			} else {
-				drawResourceBadge(canvas, key, px-iconSize/2, py-iconSize/2+offset)
+				drawResourceBadge(canvas, key, x, y)
 			}
-			if _, ignored := ignoreCountIDs[key.ID]; ignored && key.Type == mysekaiMaterialType {
-				continue
-			}
-			count := group.resources[key]
+			count := label.group.resources[key]
 			if count > 1 {
-				drawText(canvas, countFace, px+iconSize/2+5, py+offset+7, fmt.Sprintf("×%d", count))
+				drawText(canvas, countFace, x+iconSize+5, y+28, fmt.Sprintf("×%d", count))
 			}
 		}
 	}
@@ -221,6 +186,25 @@ func renderSite(drops []Drop, siteID int, resources map[int]Resource, face, coun
 		return fmt.Errorf("write %s: %w", outPath, err)
 	}
 	return nil
+}
+
+func drawMapConnection(canvas *image.RGBA, from, to image.Point) {
+	dx, dy := to.X-from.X, to.Y-from.Y
+	steps := max(absInt(dx), absInt(dy))
+	for i := 0; i <= steps; i++ {
+		point := from
+		if steps > 0 {
+			point = image.Pt(from.X+dx*i/steps, from.Y+dy*i/steps)
+		}
+		canvas.Set(point.X, point.Y, color.RGBA{145, 145, 145, 255})
+	}
+}
+
+func absInt(value int) int {
+	if value < 0 {
+		return -value
+	}
+	return value
 }
 
 // The CSV contains MySekai material icons only. A type-specific badge keeps

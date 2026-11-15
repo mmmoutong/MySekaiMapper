@@ -6,6 +6,7 @@
 
 - **路徑 A — 僅使用 Telegram**：最簡單的選項；不需要玩家路由檔或公開圖片伺服器。
 - **路徑 B — 啟用 Bark**：設定 Bark 金鑰、玩家路由與用於圖片的公開靜態檔案伺服器。
+- **路徑 C — AstrBot（QQ）**：依下方第 5 步設定 Push Lite 與接收人別名，無須公開圖片伺服器。
 
 ### 1. 需求與建置
 
@@ -83,3 +84,44 @@ go build -o bin/mysekaimapper ./cmd/mysekaimapper
     ```
 
 未設定的玩家預設會使用 Telegram。因此若未設定 Telegram，未設定的玩家將不會收到通知；僅使用 Bark 時，請明確指定 Bark 別名。
+
+### 5. 路徑 C — AstrBot（QQ）
+
+完成第 1–2 步後，直接設定 AstrBot；Telegram 與 Bark 均為選用：
+
+1. 在 AstrBot 中安裝 `astrbot_plugin_push_lite`，透過 OneBot v11 接入 QQ，並設定外掛的 API token 與監聽連接埠（預設 `9966`）。
+2. 在 `.env` 中設定推送服務（HTTP 僅適用於可信本機或 Docker 私有網路）：
+
+   ```dotenv
+   ASTRBOT_PUSH_URL=http://astrbot:9966
+   ASTRBOT_PUSH_TOKEN=your-plugin-api-token
+   ASTRBOT_ALLOW_INSECURE_HTTP=1
+   ```
+
+   位址必須能從 MySekaiMapper 存取，末尾不要加 `/send`。使用 HTTPS 時保持 `ASTRBOT_ALLOW_INSECURE_HTTP=0`。
+
+3. 由 `config/astrbot_map.example.json` 建立 `config/astrbot_map.json`，設定接收人：
+
+   ```json
+   {
+     "qq_me": {"platform_id": "qq_main", "type": "private", "qq": "123456789"}
+   }
+   ```
+
+   將 `qq_main` 替換為 AstrBot 實際的平台實例 ID（可透過 `/sid` 確認），`qq` 以字串填寫接收人的 QQ 號碼。群組則將 `type` 改為 `group`，並填寫群組號碼。
+
+4. 建立或更新 `config/push_map.json`，將實際遊戲玩家 ID 對應至接收人別名：
+
+   ```json
+   {
+     "1234567890123456789": ["astrbot:qq_me"]
+   }
+   ```
+
+5. 啟動服務：
+
+   ```bash
+   bin/mysekaimapper serve --host 0.0.0.0 --port 9478
+   ```
+
+無須公開圖片伺服器或共用目錄。未明確設定路由的玩家仍預設使用 Telegram。Push Lite 成功回應僅代表請求已加入佇列，QQ 送達結果請查看 AstrBot 日誌。完整說明見下方「通知與靜態檔案」中的 AstrBot 章節。

@@ -6,6 +6,7 @@
 
 - **경로 A — Telegram만 사용**: 가장 간단한 선택지입니다. 플레이어 라우팅 파일이나 공개 이미지 서버가 필요하지 않습니다.
 - **경로 B — Bark 사용**: Bark 키, 플레이어 라우팅 및 이미지용 공개 정적 파일 서버를 구성합니다.
+- **경로 C — AstrBot(QQ)**: 아래 5단계에서 Push Lite와 수신자 별칭을 구성합니다. 공개 이미지 서버는 필요하지 않습니다.
 
 ### 1. 요구 사항 및 빌드
 
@@ -83,3 +84,44 @@ go build -o bin/mysekaimapper ./cmd/mysekaimapper
     ```
 
 구성되지 않은 플레이어는 Telegram으로 전송됩니다. Telegram을 구성하지 않았다면 구성되지 않은 플레이어는 알림을 받지 않으므로, Bark만 사용하는 경우에는 Bark 별칭을 명시적으로 지정하세요.
+
+### 5. 경로 C — AstrBot(QQ)
+
+1–2단계를 마친 뒤 AstrBot을 직접 구성하세요. Telegram과 Bark는 선택 사항입니다.
+
+1. AstrBot에 `astrbot_plugin_push_lite`를 설치하고 OneBot v11으로 QQ를 연결한 뒤, 플러그인의 API token과 수신 포트(기본 `9966`)를 설정합니다.
+2. `.env`에 푸시 서비스를 설정합니다(HTTP는 신뢰할 수 있는 로컬 또는 Docker 사설 네트워크에서만 사용하세요).
+
+   ```dotenv
+   ASTRBOT_PUSH_URL=http://astrbot:9966
+   ASTRBOT_PUSH_TOKEN=your-plugin-api-token
+   ASTRBOT_ALLOW_INSECURE_HTTP=1
+   ```
+
+   MySekaiMapper에서 접근할 수 있는 주소를 사용하고 끝에 `/send`를 붙이지 마세요. HTTPS를 사용하면 `ASTRBOT_ALLOW_INSECURE_HTTP=0`을 유지하세요.
+
+3. `config/astrbot_map.example.json`을 바탕으로 `config/astrbot_map.json`을 만들고 수신자를 설정합니다.
+
+   ```json
+   {
+     "qq_me": {"platform_id": "qq_main", "type": "private", "qq": "123456789"}
+   }
+   ```
+
+   `qq_main`을 실제 AstrBot 플랫폼 인스턴스 ID(`/sid`로 확인 가능)로 바꾸고, `qq`에는 수신자의 QQ 번호를 문자열로 입력하세요. 그룹은 `type`을 `group`으로 바꾸고 그룹 번호를 입력하세요.
+
+4. `config/push_map.json`을 만들거나 수정하여 실제 게임 플레이어 ID를 수신자 별칭에 매핑합니다.
+
+   ```json
+   {
+     "1234567890123456789": ["astrbot:qq_me"]
+   }
+   ```
+
+5. 서비스를 시작합니다.
+
+   ```bash
+   bin/mysekaimapper serve --host 0.0.0.0 --port 9478
+   ```
+
+공개 이미지 서버나 공유 디렉터리는 필요하지 않습니다. 라우팅을 명시하지 않은 플레이어는 여전히 Telegram으로 전송됩니다. Push Lite의 성공 응답은 요청이 대기열에 등록되었다는 뜻이며, QQ 전달 결과는 AstrBot 로그에서 확인하세요. 자세한 내용은 아래 '알림 및 정적 파일'의 AstrBot 절을 참고하세요.

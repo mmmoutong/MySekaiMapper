@@ -25,7 +25,8 @@ mysekaimapper serve
     ├─ archive data/archive/by-id/<player_id>/<timestamp>/
     └─ publish data/latest/ and notify
          ├─ Telegram: upload local images as multipart media groups
-         └─ Bark: send image URLs from a public static-file server
+         ├─ Bark: send image URLs from a public static-file server
+         └─ AstrBot (QQ): submit text and Base64 images through Push Lite
 ```
 
 ## クイックスタート
@@ -34,6 +35,7 @@ mysekaimapper serve
 
 - **経路 A — Telegram のみ**：最も簡単な選択肢です。プレイヤーのルーティングファイルや公開画像サーバーは必要ありません。
 - **経路 B — Bark を有効化**：Bark キー、プレイヤールーティング、画像用の公開静的ファイルサーバーを設定します。
+- **経路 C — AstrBot（QQ）**：下の手順 5 で Push Lite と送信先エイリアスを設定します。公開画像サーバーは不要です。
 
 ### 1. 必要要件とビルド
 
@@ -111,6 +113,47 @@ go build -o bin/mysekaimapper ./cmd/mysekaimapper
     ```
 
 未設定のプレイヤーは Telegram が既定です。そのため Telegram が未設定の場合、未設定プレイヤーには通知されません。Bark 専用で使う場合は、Bark エイリアスを明示的に割り当ててください。
+
+### 5. 経路 C — AstrBot（QQ）
+
+手順 1–2 の完了後、AstrBot を直接設定します。Telegram と Bark は任意です。
+
+1. AstrBot に `astrbot_plugin_push_lite` をインストールし、OneBot v11 で QQ を接続して、プラグインの API token と待ち受けポート（既定 `9966`）を設定します。
+2. `.env` に送信サービスを設定します（HTTP は信頼できるローカル環境または Docker のプライベートネットワーク専用です）。
+
+   ```dotenv
+   ASTRBOT_PUSH_URL=http://astrbot:9966
+   ASTRBOT_PUSH_TOKEN=your-plugin-api-token
+   ASTRBOT_ALLOW_INSECURE_HTTP=1
+   ```
+
+   MySekaiMapper から接続できるアドレスを使用し、末尾に `/send` を付けないでください。HTTPS では `ASTRBOT_ALLOW_INSECURE_HTTP=0` のままにします。
+
+3. `config/astrbot_map.example.json` から `config/astrbot_map.json` を作成し、送信先を設定します。
+
+   ```json
+   {
+     "qq_me": {"platform_id": "qq_main", "type": "private", "qq": "123456789"}
+   }
+   ```
+
+   `qq_main` を AstrBot の実際のプラットフォームインスタンス ID（`/sid` で確認可能）に置き換え、`qq` に送信先の QQ 番号を文字列で指定します。グループの場合は `type` を `group` に変更し、グループ番号を指定します。
+
+4. `config/push_map.json` を作成または更新し、実際のゲームプレイヤー ID を送信先エイリアスに対応付けます。
+
+   ```json
+   {
+     "1234567890123456789": ["astrbot:qq_me"]
+   }
+   ```
+
+5. サービスを起動します。
+
+   ```bash
+   bin/mysekaimapper serve --host 0.0.0.0 --port 9478
+   ```
+
+公開画像サーバーや共有ディレクトリは不要です。ルート未設定のプレイヤーは引き続き Telegram が既定です。Push Lite の成功応答はキューへの登録を示します。QQ への配信結果は AstrBot のログで確認してください。詳細は後述の「通知と静的ファイル」の AstrBot 節を参照してください。
 
 ## サービスの実行
 

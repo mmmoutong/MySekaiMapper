@@ -213,7 +213,9 @@ func runServe(root string, args []string) {
 	}
 	// Resume archives accepted by a previous run that stopped before
 	// processing them (crash, forced stop, or shutdown timeout).
-	if _, err := submitter.Recover(); err != nil {
+	if _, _, err := mapper.AESParams(); err != nil {
+		log.Printf("[QUEUE] pending archive recovery deferred: %v", err)
+	} else if _, err := submitter.Recover(); err != nil {
 		log.Printf("[QUEUE] could not recover pending archives: %v", err)
 	}
 	handler, err := httpserver.New(httpserver.ConfigFromSettings(settings), chunks, submitter)

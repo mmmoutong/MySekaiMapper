@@ -20,6 +20,7 @@ var (
 	ErrChunkTotalTooLarge    = errors.New("combined upload exceeds configured limit")
 	ErrChunkTotalMismatch    = errors.New("upload id was reused with a different total chunk count")
 	ErrChunkAlreadySubmitted = errors.New("merged upload was already submitted")
+	ErrChunkStoreFull        = errors.New("temporary upload storage quota exceeded")
 	ErrInvalidChunk          = errors.New("invalid chunk parameters")
 )
 
@@ -48,9 +49,11 @@ type Store struct {
 	ArchiveDir string
 	LatestDir  string
 
-	rawMu     sync.Mutex
-	archiveMu sync.Mutex
-	latestMu  sync.Mutex
+	rawMu           sync.Mutex
+	uploadQueueDir  string
+	lastUploadPrune time.Time
+	archiveMu       sync.Mutex
+	latestMu        sync.Mutex
 }
 
 func NewStore(settings Settings) (*Store, error) {
@@ -62,12 +65,14 @@ func NewStore(settings Settings) (*Store, error) {
 		ArchiveDir: settings.ArchiveDir,
 		LatestDir:  settings.LatestDir,
 	}
+	store.uploadQueueDir = filepath.Join(store.PendingDir, ".uploads")
 	for _, directory := range []struct {
 		path string
 		mode os.FileMode
 	}{
 		{store.RawDir, 0o700},
 		{store.PendingDir, 0o700},
+		{store.uploadQueueDir, 0o700},
 		{store.FailedDir, 0o700},
 		{store.TmpDir, 0o700},
 		{store.ArchiveDir, 0o755},
@@ -88,14 +93,11 @@ func NewStore(settings Settings) (*Store, error) {
 func (s *Store) SaveRaw(data []byte, userID, taskID string) (string, error) {
 	s.rawMu.Lock()
 	defer s.rawMu.Unlock()
-	if int64(len(data)) > 1*1024*1024 {
-		return "", ErrChunkTotalTooLarge
+	name, err := rawArchiveName(data, userID, taskID)
+	if err != nil {
+		return "", err
 	}
-	userID = normalizeUserID(userID)
-	if !validTaskID.MatchString(taskID) {
-		return "", fmt.Errorf("invalid task id")
-	}
-	filename := fmt.Sprintf("mysekai_%s_%s.bin", userID, taskID)
+	filename := name
 	// Keep names unique across pending and processed archives so a finished
 	// archive never overwrites an earlier one when it is moved to RawDir.
 	for fileExists(filepath.Join(s.PendingDir, filename)) || fileExists(filepath.Join(s.RawDir, filename)) {
@@ -103,13 +105,23 @@ func (s *Store) SaveRaw(data []byte, userID, taskID string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		filename = fmt.Sprintf("mysekai_%s_%s_%s.bin", userID, taskID, suffix)
+		filename = strings.TrimSuffix(name, ".bin") + "_" + suffix + ".bin"
 	}
 	path := filepath.Join(s.PendingDir, filename)
 	if err := atomicWrite(path, data, 0o600); err != nil {
 		return "", fmt.Errorf("save raw archive: %w", err)
 	}
 	return path, nil
+}
+
+func rawArchiveName(data []byte, userID, taskID string) (string, error) {
+	if int64(len(data)) > 1*1024*1024 {
+		return "", ErrChunkTotalTooLarge
+	}
+	if !validTaskID.MatchString(taskID) {
+		return "", fmt.Errorf("invalid task id")
+	}
+	return fmt.Sprintf("mysekai_%s_%s.bin", normalizeUserID(userID), taskID), nil
 }
 
 // PendingArchive is a raw archive that was accepted but not yet processed.
@@ -119,20 +131,47 @@ type PendingArchive struct {
 	TaskID string
 }
 
+type pendingFile struct {
+	archive PendingArchive
+	modTime time.Time
+}
+
 // PendingRaw lists archives left in PendingDir, oldest first. They were
 // accepted by a previous process that stopped before finishing them.
 func (s *Store) PendingRaw() ([]PendingArchive, error) {
 	s.rawMu.Lock()
 	defer s.rawMu.Unlock()
-	entries, err := os.ReadDir(s.PendingDir)
+	files, err := appendPendingFiles(nil, s.PendingDir)
 	if err != nil {
 		return nil, err
 	}
-	type pendingFile struct {
-		archive PendingArchive
-		modTime time.Time
+	uploads, err := os.ReadDir(s.uploadQueueDir)
+	if err != nil {
+		return nil, err
 	}
-	files := make([]pendingFile, 0, len(entries))
+	s.pruneUploadQueueLocked(uploads, time.Now())
+	for _, upload := range uploads {
+		if !upload.IsDir() || strings.HasPrefix(upload.Name(), uploadStagingPrefix) {
+			continue
+		}
+		files, err = appendPendingFiles(files, filepath.Join(s.uploadQueueDir, upload.Name()))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+	}
+	sort.SliceStable(files, func(i, j int) bool { return files[i].modTime.Before(files[j].modTime) })
+	result := make([]PendingArchive, 0, len(files))
+	for _, file := range files {
+		result = append(result, file.archive)
+	}
+	return result, nil
+}
+
+func appendPendingFiles(files []pendingFile, directory string) ([]pendingFile, error) {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return files, err
+	}
 	for _, entry := range entries {
 		if !entry.Type().IsRegular() {
 			continue
@@ -143,19 +182,14 @@ func (s *Store) PendingRaw() ([]PendingArchive, error) {
 		}
 		info, err := entry.Info()
 		if err != nil {
-			return nil, err
+			return files, err
 		}
 		files = append(files, pendingFile{
-			archive: PendingArchive{Path: filepath.Join(s.PendingDir, entry.Name()), UserID: userID, TaskID: taskID},
+			archive: PendingArchive{Path: filepath.Join(directory, entry.Name()), UserID: userID, TaskID: taskID},
 			modTime: info.ModTime(),
 		})
 	}
-	sort.SliceStable(files, func(i, j int) bool { return files[i].modTime.Before(files[j].modTime) })
-	result := make([]PendingArchive, 0, len(files))
-	for _, file := range files {
-		result = append(result, file.archive)
-	}
-	return result, nil
+	return files, nil
 }
 
 // parseRawName recovers routing metadata from mysekai_<user>_<task>[_<suffix>].bin.
@@ -186,7 +220,8 @@ func parseRawName(name string) (string, string, bool) {
 func (s *Store) FinishRaw(path string, succeeded bool) error {
 	s.rawMu.Lock()
 	defer s.rawMu.Unlock()
-	if filepath.Dir(path) != filepath.Clean(s.PendingDir) {
+	directory := filepath.Dir(path)
+	if directory != filepath.Clean(s.PendingDir) && filepath.Dir(directory) != filepath.Clean(s.uploadQueueDir) {
 		return fmt.Errorf("raw archive is not in the pending directory")
 	}
 	destinationDir := s.RawDir
@@ -202,6 +237,8 @@ func (s *Store) FinishRaw(path string, succeeded bool) error {
 		}
 		destination = filepath.Join(destinationDir, strings.TrimSuffix(name, ".bin")+"_"+suffix+".bin")
 	}
+	// For chunk uploads, the now-empty directory remains as the receipt.
+	// Moving the archive updates its directory's modification time.
 	if err := os.Rename(path, destination); err != nil {
 		return fmt.Errorf("move processed raw archive: %w", err)
 	}
@@ -340,8 +377,9 @@ const (
 	// client retry of the last chunk is acknowledged instead of reprocessed.
 	SubmittedRetention = 24 * time.Hour
 	pruneInterval      = 5 * time.Minute
-	// submittedDirName cannot collide with an upload ID, which may not
-	// contain a dot.
+	maxPendingUploads  = 256
+	maxPendingBytes    = 64 * 1024 * 1024
+	// submittedDirName identifies receipts written by earlier versions.
 	submittedDirName = ".submitted"
 )
 
@@ -349,10 +387,14 @@ const (
 // request bodies longer than needed. All operations are serialized to preserve
 // consistency for concurrent requests using the same upload ID.
 type ChunkStore struct {
-	Root         string
-	MaxTotalSize int64
-	mu           sync.Mutex
-	lastPrune    time.Time
+	Root           string
+	MaxTotalSize   int64
+	maxUploads     int
+	maxBytes       int64
+	mu             sync.Mutex
+	lastPrune      time.Time
+	pendingUploads int
+	pendingBytes   int64
 }
 
 func NewChunkStore(root string, maxTotalSize int64) (*ChunkStore, error) {
@@ -362,7 +404,16 @@ func NewChunkStore(root string, maxTotalSize int64) (*ChunkStore, error) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, fmt.Errorf("create chunk directory: %w", err)
 	}
-	return &ChunkStore{Root: root, MaxTotalSize: maxTotalSize}, nil
+	store := &ChunkStore{
+		Root:         root,
+		MaxTotalSize: maxTotalSize,
+		maxUploads:   maxPendingUploads,
+		maxBytes:     maxPendingBytes,
+	}
+	if err := store.scanUsageLocked(); err != nil {
+		return nil, fmt.Errorf("measure temporary upload storage: %w", err)
+	}
+	return store, nil
 }
 
 // Add writes a chunk and returns a merged archive only after every index in
@@ -393,41 +444,53 @@ func (s *ChunkStore) Add(uploadID string, index, total int, data []byte) ([]byte
 			return nil, false, err
 		}
 	}
-	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return nil, false, err
-	}
 	metaPath := filepath.Join(directory, ".total")
-	if existing, err := os.ReadFile(metaPath); err == nil {
+	existing, metaErr := os.ReadFile(metaPath)
+	if metaErr == nil {
 		expected, parseErr := strconv.Atoi(strings.TrimSpace(string(existing)))
 		if parseErr != nil || expected != total {
 			return nil, false, ErrChunkTotalMismatch
 		}
-	} else if errors.Is(err, os.ErrNotExist) {
-		if err := atomicWrite(metaPath, []byte(strconv.Itoa(total)), 0o600); err != nil {
-			return nil, false, err
-		}
-	} else {
-		return nil, false, err
+	} else if !errors.Is(metaErr, os.ErrNotExist) {
+		return nil, false, metaErr
 	}
 
 	target := filepath.Join(directory, fmt.Sprintf("chunk_%d", index))
 	currentSize, err := chunkSize(directory)
-	if err != nil {
+	newUpload := errors.Is(err, os.ErrNotExist)
+	if err != nil && !newUpload {
 		return nil, false, err
 	}
+	addedBytes := int64(len(data))
 	if info, err := os.Stat(target); err == nil && info.Mode().IsRegular() {
-		currentSize -= info.Size()
+		addedBytes -= info.Size()
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, false, err
 	}
-	if currentSize+int64(len(data)) > s.MaxTotalSize {
+	mergedSize := currentSize + addedBytes
+	if mergedSize > s.MaxTotalSize {
 		return nil, false, ErrChunkTotalTooLarge
+	}
+	if (newUpload && s.pendingUploads >= s.maxUploads) || (addedBytes > 0 && addedBytes > s.maxBytes-s.pendingBytes) {
+		return nil, false, ErrChunkStoreFull
+	}
+	if newUpload {
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			return nil, false, err
+		}
+		s.pendingUploads++
+	}
+	if metaErr != nil {
+		if err := atomicWrite(metaPath, []byte(strconv.Itoa(total)), 0o600); err != nil {
+			return nil, false, err
+		}
 	}
 	if err := atomicWrite(target, data, 0o600); err != nil {
 		return nil, false, err
 	}
+	s.pendingBytes += addedBytes
 
-	merged := make([]byte, 0, currentSize+int64(len(data)))
+	merged := make([]byte, 0, mergedSize)
 	for chunkIndex := 0; chunkIndex < total; chunkIndex++ {
 		path := filepath.Join(directory, fmt.Sprintf("chunk_%d", chunkIndex))
 		part, err := os.ReadFile(path)
@@ -447,27 +510,28 @@ func (s *ChunkStore) Add(uploadID string, index, total int, data []byte) ([]byte
 	return merged, true, nil
 }
 
-// MarkSubmitted records a successful handoff outside the chunk directory, so
-// the record survives Complete. A client that retries the last chunk because
-// it never saw the response is then acknowledged without a duplicate job.
-func (s *ChunkStore) MarkSubmitted(uploadID string) error {
-	if !validTaskID.MatchString(uploadID) {
-		return ErrInvalidChunk
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return atomicWrite(s.submittedPath(uploadID), []byte("1"), 0o600)
-}
-
-// Complete removes a merged upload's chunks only after its raw archive was
-// persisted. The submitted record is kept until SubmittedRetention expires.
+// Complete removes a merged upload's chunks and releases their quota.
 func (s *ChunkStore) Complete(uploadID string) error {
 	if !validTaskID.MatchString(uploadID) {
 		return ErrInvalidChunk
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return os.RemoveAll(filepath.Join(s.Root, uploadID))
+	directory := filepath.Join(s.Root, uploadID)
+	size, err := chunkSize(directory)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := os.RemoveAll(directory); err != nil {
+		// Some files may have been removed before the error.
+		return errors.Join(err, s.scanUsageLocked())
+	}
+	s.pendingUploads--
+	s.pendingBytes -= size
+	return nil
 }
 
 // PruneStale removes incomplete uploads idle for longer than StaleUploadAge
@@ -514,7 +578,29 @@ func (s *ChunkStore) pruneLocked(now time.Time) error {
 			}
 		}
 	}
-	return errors.Join(errorsSeen...)
+	return errors.Join(append(errorsSeen, s.scanUsageLocked())...)
+}
+
+func (s *ChunkStore) scanUsageLocked() error {
+	entries, err := os.ReadDir(s.Root)
+	if err != nil {
+		return err
+	}
+	var uploads int
+	var bytes int64
+	for _, entry := range entries {
+		if !entry.IsDir() || !validTaskID.MatchString(entry.Name()) {
+			continue
+		}
+		size, err := chunkSize(filepath.Join(s.Root, entry.Name()))
+		if err != nil {
+			return err
+		}
+		uploads++
+		bytes += size
+	}
+	s.pendingUploads, s.pendingBytes = uploads, bytes
+	return nil
 }
 
 func (s *ChunkStore) submittedPath(uploadID string) string {

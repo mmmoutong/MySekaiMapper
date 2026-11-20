@@ -47,6 +47,14 @@ func (s *recordingSubmitter) Submit(_ context.Context, data []byte, userID, task
 	return nil
 }
 
+func (s *recordingSubmitter) SubmitUpload(ctx context.Context, data []byte, userID, taskID string) error {
+	return s.Submit(ctx, data, userID, taskID)
+}
+
+func (s *recordingSubmitter) UploadSubmitted(string) (bool, error) {
+	return false, nil
+}
+
 func (s *recordingSubmitter) snapshot() []submittedArchive {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -295,15 +303,6 @@ func TestChunkUploadRetryAfterSuccessIsNotProcessedTwice(t *testing.T) {
 	setTestAESKeys(t)
 	archive := validEncryptedArchive(t)
 	config := baseConfig()
-	chunks, err := service.NewChunkStore(t.TempDir(), config.MaxTotalSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	submitter := &recordingSubmitter{}
-	handler, err := New(config, chunks, submitter)
-	if err != nil {
-		t.Fatal(err)
-	}
 	half := len(archive) / 2
 	cases := []struct {
 		name   string
@@ -315,7 +314,39 @@ func TestChunkUploadRetryAfterSuccessIsNotProcessedTwice(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			before := len(submitter.snapshot())
+			root := t.TempDir()
+			t.Setenv("MYSK_DATA_DIR", root)
+			settings := service.SettingsFromRoot(root)
+			chunkDir := filepath.Join(root, "uploads")
+			var jobs int
+			processor := testUploadProcessor(func(context.Context, string, string, string) error {
+				jobs++
+				return nil
+			})
+			open := func(skipCleanup bool) (*Handler, *service.AsyncSubmitter) {
+				t.Helper()
+				store, err := service.NewStore(settings)
+				if err != nil {
+					t.Fatal(err)
+				}
+				chunks, err := service.NewChunkStore(chunkDir, config.MaxTotalSize)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var uploads chunkAdder = chunks
+				if skipCleanup {
+					uploads = cleanupFailingChunks{ChunkStore: chunks}
+				}
+				submitter := &service.AsyncSubmitter{Store: store, Processor: processor}
+				handler, err := New(config, uploads, submitter)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(submitter.Close)
+				return handler, submitter
+			}
+
+			handler, first := open(true)
 			total := len(tc.chunks)
 			for index, chunk := range tc.chunks {
 				response := httptest.NewRecorder()
@@ -324,20 +355,41 @@ func TestChunkUploadRetryAfterSuccessIsNotProcessedTwice(t *testing.T) {
 					t.Fatalf("chunk %d status=%d", index, response.Code)
 				}
 			}
-			// The client never saw the last response and sends the last chunk again.
+			first.Close()
+			if _, err := os.Stat(filepath.Join(chunkDir, tc.id)); err != nil {
+				t.Fatalf("failed cleanup did not leave chunks for retry: %v", err)
+			}
+
+			// The client did not receive the final response and retries after a restart.
+			handler, restarted := open(false)
 			response := httptest.NewRecorder()
 			handler.Routes().ServeHTTP(response, uploadRequest(tc.chunks[total-1], tc.id, total-1, total))
 			if response.Code != http.StatusOK {
 				t.Fatalf("retry status=%d body=%q", response.Code, response.Body.String())
 			}
-			if got := len(submitter.snapshot()) - before; got != 1 {
-				t.Fatalf("got %d submissions, want 1", got)
+			restarted.Close()
+			if jobs != 1 {
+				t.Fatalf("processed %d jobs, want 1", jobs)
 			}
-			if _, err := os.Stat(filepath.Join(chunks.Root, tc.id)); !os.IsNotExist(err) {
+			if _, err := os.Stat(filepath.Join(chunkDir, tc.id)); !os.IsNotExist(err) {
 				t.Fatalf("retry left an orphan chunk directory: %v", err)
 			}
 		})
 	}
+}
+
+type testUploadProcessor func(context.Context, string, string, string) error
+
+func (process testUploadProcessor) Process(ctx context.Context, path, userID, taskID string) error {
+	return process(ctx, path, userID, taskID)
+}
+
+type cleanupFailingChunks struct {
+	*service.ChunkStore
+}
+
+func (cleanupFailingChunks) Complete(string) error {
+	return errors.New("temporary cleanup failure")
 }
 
 func TestChunkUploadRejectsBadParametersAndSize(t *testing.T) {

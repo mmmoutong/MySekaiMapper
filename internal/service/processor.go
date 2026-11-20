@@ -145,6 +145,22 @@ type AsyncSubmitter struct {
 }
 
 func (s *AsyncSubmitter) Submit(_ context.Context, data []byte, userID, taskID string) error {
+	return s.submit(data, userID, taskID, s.Store.SaveRaw)
+}
+
+// SubmitUpload accepts a chunk upload at most once within the receipt lifetime.
+func (s *AsyncSubmitter) SubmitUpload(_ context.Context, data []byte, userID, uploadID string) error {
+	return s.submit(data, userID, uploadID, s.Store.SaveUpload)
+}
+
+func (s *AsyncSubmitter) UploadSubmitted(uploadID string) (bool, error) {
+	if s.Store == nil {
+		return false, fmt.Errorf("submitter is not configured")
+	}
+	return s.Store.UploadSubmitted(uploadID)
+}
+
+func (s *AsyncSubmitter) submit(data []byte, userID, taskID string, save func([]byte, string, string) (string, error)) error {
 	if s.Store == nil || s.Processor == nil {
 		return fmt.Errorf("submitter is not configured")
 	}
@@ -154,11 +170,11 @@ func (s *AsyncSubmitter) Submit(_ context.Context, data []byte, userID, taskID s
 	if s.closed {
 		return ErrSubmitterClosed
 	}
-	// Hold the queue lock through SaveRaw so Close cannot accept a file that
-	// would never be scheduled for processing.
+	// Hold the queue lock through persistence so Close cannot leave an
+	// accepted archive unscheduled.
 	playerID := normalizeUserID(userID)
-	path, err := s.Store.SaveRaw(data, playerID, taskID)
-	if err != nil {
+	path, err := save(data, playerID, taskID)
+	if err != nil || path == "" {
 		return err
 	}
 	s.pending = append(s.pending, queuedJob{path: path, userID: playerID, taskID: taskID})
@@ -279,8 +295,12 @@ func (s *AsyncSubmitter) processJob(job queuedJob) {
 	if err != nil && !errors.Is(err, errProcessorPanicked) && s.Logf != nil {
 		s.Logf("[ERROR] processing failed task=%s: %v", job.taskID, err)
 	}
-	// Move the archive out of the pending directory either way, so it is not
-	// recovered again and a failing archive cannot accumulate without bound.
+	if errors.Is(err, mapper.ErrAESNotConfigured) {
+		// This is a local configuration error. Keep the archive recoverable
+		// when the service restarts with valid AES parameters.
+		return
+	}
+	// Finalize successful and terminally failed archives.
 	if finishErr := s.Store.FinishRaw(job.path, err == nil); finishErr != nil && s.Logf != nil {
 		s.Logf("[ERROR] could not finalize raw archive task=%s: %v", job.taskID, finishErr)
 	}

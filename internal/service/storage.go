@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,10 +29,21 @@ var (
 	chunkName   = regexp.MustCompile(`^chunk_(\d+)$`)
 )
 
+// MaxFailedRawArchives bounds how many unprocessable raw archives are kept for
+// debugging. Older failures are deleted so bad input cannot fill the disk.
+const MaxFailedRawArchives = 20
+
 // Store owns service runtime directories. It never treats a user-supplied ID
 // as a path component without validation.
+//
+// Accepted raw archives are written to PendingDir first. A successfully
+// processed archive is moved to RawDir (the historical location), a failed one
+// to FailedDir. Anything left in PendingDir after a crash is recovered on the
+// next start.
 type Store struct {
 	RawDir     string
+	PendingDir string
+	FailedDir  string
 	TmpDir     string
 	ArchiveDir string
 	LatestDir  string
@@ -44,6 +56,8 @@ type Store struct {
 func NewStore(settings Settings) (*Store, error) {
 	store := &Store{
 		RawDir:     settings.RawDir,
+		PendingDir: filepath.Join(settings.RawDir, "pending"),
+		FailedDir:  filepath.Join(settings.RawDir, "failed"),
 		TmpDir:     settings.TmpDir,
 		ArchiveDir: settings.ArchiveDir,
 		LatestDir:  settings.LatestDir,
@@ -53,6 +67,8 @@ func NewStore(settings Settings) (*Store, error) {
 		mode os.FileMode
 	}{
 		{store.RawDir, 0o700},
+		{store.PendingDir, 0o700},
+		{store.FailedDir, 0o700},
 		{store.TmpDir, 0o700},
 		{store.ArchiveDir, 0o755},
 		{store.LatestDir, 0o755},
@@ -67,8 +83,8 @@ func NewStore(settings Settings) (*Store, error) {
 	return store, nil
 }
 
-// SaveRaw persists the encrypted archive with owner-only permissions before it
-// is processed asynchronously.
+// SaveRaw persists the encrypted archive with owner-only permissions in
+// PendingDir before it is processed asynchronously.
 func (s *Store) SaveRaw(data []byte, userID, taskID string) (string, error) {
 	s.rawMu.Lock()
 	defer s.rawMu.Unlock()
@@ -80,18 +96,153 @@ func (s *Store) SaveRaw(data []byte, userID, taskID string) (string, error) {
 		return "", fmt.Errorf("invalid task id")
 	}
 	filename := fmt.Sprintf("mysekai_%s_%s.bin", userID, taskID)
-	path := filepath.Join(s.RawDir, filename)
-	for fileExists(path) {
+	// Keep names unique across pending and processed archives so a finished
+	// archive never overwrites an earlier one when it is moved to RawDir.
+	for fileExists(filepath.Join(s.PendingDir, filename)) || fileExists(filepath.Join(s.RawDir, filename)) {
 		suffix, err := randomID(4)
 		if err != nil {
 			return "", err
 		}
-		path = filepath.Join(s.RawDir, fmt.Sprintf("mysekai_%s_%s_%s.bin", userID, taskID, suffix))
+		filename = fmt.Sprintf("mysekai_%s_%s_%s.bin", userID, taskID, suffix)
 	}
+	path := filepath.Join(s.PendingDir, filename)
 	if err := atomicWrite(path, data, 0o600); err != nil {
 		return "", fmt.Errorf("save raw archive: %w", err)
 	}
 	return path, nil
+}
+
+// PendingArchive is a raw archive that was accepted but not yet processed.
+type PendingArchive struct {
+	Path   string
+	UserID string
+	TaskID string
+}
+
+// PendingRaw lists archives left in PendingDir, oldest first. They were
+// accepted by a previous process that stopped before finishing them.
+func (s *Store) PendingRaw() ([]PendingArchive, error) {
+	s.rawMu.Lock()
+	defer s.rawMu.Unlock()
+	entries, err := os.ReadDir(s.PendingDir)
+	if err != nil {
+		return nil, err
+	}
+	type pendingFile struct {
+		archive PendingArchive
+		modTime time.Time
+	}
+	files := make([]pendingFile, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() {
+			continue
+		}
+		userID, taskID, ok := parseRawName(entry.Name())
+		if !ok {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, pendingFile{
+			archive: PendingArchive{Path: filepath.Join(s.PendingDir, entry.Name()), UserID: userID, TaskID: taskID},
+			modTime: info.ModTime(),
+		})
+	}
+	sort.SliceStable(files, func(i, j int) bool { return files[i].modTime.Before(files[j].modTime) })
+	result := make([]PendingArchive, 0, len(files))
+	for _, file := range files {
+		result = append(result, file.archive)
+	}
+	return result, nil
+}
+
+// parseRawName recovers routing metadata from mysekai_<user>_<task>[_<suffix>].bin.
+// The user part never contains an underscore (digits or "unknown").
+func parseRawName(name string) (string, string, bool) {
+	if !strings.HasPrefix(name, "mysekai_") || !strings.HasSuffix(name, ".bin") {
+		return "", "", false
+	}
+	userID, taskID, ok := strings.Cut(strings.TrimSuffix(strings.TrimPrefix(name, "mysekai_"), ".bin"), "_")
+	if !ok || normalizeUserID(userID) != userID {
+		return "", "", false
+	}
+	if !validTaskID.MatchString(taskID) {
+		// A collision suffix can push a 64-character task ID over the limit.
+		// The task ID only labels logs and notifications, so trim the suffix.
+		if index := strings.LastIndex(taskID, "_"); index > 0 && validTaskID.MatchString(taskID[:index]) {
+			taskID = taskID[:index]
+		} else {
+			return "", "", false
+		}
+	}
+	return userID, taskID, true
+}
+
+// FinishRaw moves a processed archive out of PendingDir: to RawDir when
+// processing succeeded, or to FailedDir otherwise. FailedDir keeps only the
+// newest MaxFailedRawArchives files.
+func (s *Store) FinishRaw(path string, succeeded bool) error {
+	s.rawMu.Lock()
+	defer s.rawMu.Unlock()
+	if filepath.Dir(path) != filepath.Clean(s.PendingDir) {
+		return fmt.Errorf("raw archive is not in the pending directory")
+	}
+	destinationDir := s.RawDir
+	if !succeeded {
+		destinationDir = s.FailedDir
+	}
+	name := filepath.Base(path)
+	destination := filepath.Join(destinationDir, name)
+	for fileExists(destination) {
+		suffix, err := randomID(4)
+		if err != nil {
+			return err
+		}
+		destination = filepath.Join(destinationDir, strings.TrimSuffix(name, ".bin")+"_"+suffix+".bin")
+	}
+	if err := os.Rename(path, destination); err != nil {
+		return fmt.Errorf("move processed raw archive: %w", err)
+	}
+	if !succeeded {
+		return pruneOldestFiles(s.FailedDir, MaxFailedRawArchives)
+	}
+	return nil
+}
+
+// pruneOldestFiles keeps the newest keep regular files in directory.
+func pruneOldestFiles(directory string, keep int) error {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return err
+	}
+	type fileInfo struct {
+		path    string
+		modTime time.Time
+	}
+	files := make([]fileInfo, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		files = append(files, fileInfo{path: filepath.Join(directory, entry.Name()), modTime: info.ModTime()})
+	}
+	if len(files) <= keep {
+		return nil
+	}
+	sort.SliceStable(files, func(i, j int) bool { return files[i].modTime.After(files[j].modTime) })
+	var errorsSeen []error
+	for _, file := range files[keep:] {
+		if err := os.Remove(file.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errorsSeen = append(errorsSeen, err)
+		}
+	}
+	return errors.Join(errorsSeen...)
 }
 
 func normalizeUserID(value string) string {
@@ -181,6 +332,19 @@ func (s *Store) PromoteLatest(sourceDir string) error {
 	return nil
 }
 
+const (
+	// StaleUploadAge is how long an incomplete chunk upload may sit idle before
+	// its directory is removed.
+	StaleUploadAge = time.Hour
+	// SubmittedRetention is how long a completed upload ID is remembered, so a
+	// client retry of the last chunk is acknowledged instead of reprocessed.
+	SubmittedRetention = 24 * time.Hour
+	pruneInterval      = 5 * time.Minute
+	// submittedDirName cannot collide with an upload ID, which may not
+	// contain a dot.
+	submittedDirName = ".submitted"
+)
+
 // ChunkStore persists bounded chunk uploads so the process does not retain
 // request bodies longer than needed. All operations are serialized to preserve
 // consistency for concurrent requests using the same upload ID.
@@ -188,6 +352,7 @@ type ChunkStore struct {
 	Root         string
 	MaxTotalSize int64
 	mu           sync.Mutex
+	lastPrune    time.Time
 }
 
 func NewChunkStore(root string, maxTotalSize int64) (*ChunkStore, error) {
@@ -213,13 +378,22 @@ func (s *ChunkStore) Add(uploadID string, index, total int, data []byte) ([]byte
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	directory := filepath.Join(s.Root, uploadID)
-	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return nil, false, err
+	if now := time.Now(); now.Sub(s.lastPrune) >= pruneInterval {
+		// Best-effort housekeeping; a failure must not reject a valid chunk.
+		_ = s.pruneLocked(now)
 	}
-	if _, err := os.Stat(filepath.Join(directory, ".submitted")); err == nil {
-		return nil, false, ErrChunkAlreadySubmitted
-	} else if !errors.Is(err, os.ErrNotExist) {
+
+	directory := filepath.Join(s.Root, uploadID)
+	// Check the marker before creating the directory, so a retry of an upload
+	// that was already submitted and cleaned up leaves nothing behind.
+	for _, marker := range []string{s.submittedPath(uploadID), filepath.Join(directory, ".submitted")} {
+		if _, err := os.Stat(marker); err == nil {
+			return nil, false, ErrChunkAlreadySubmitted
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, false, err
+		}
+	}
+	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return nil, false, err
 	}
 	metaPath := filepath.Join(directory, ".total")
@@ -273,21 +447,20 @@ func (s *ChunkStore) Add(uploadID string, index, total int, data []byte) ([]byte
 	return merged, true, nil
 }
 
-// MarkSubmitted makes successful handoff idempotent if a later cleanup fails.
+// MarkSubmitted records a successful handoff outside the chunk directory, so
+// the record survives Complete. A client that retries the last chunk because
+// it never saw the response is then acknowledged without a duplicate job.
 func (s *ChunkStore) MarkSubmitted(uploadID string) error {
 	if !validTaskID.MatchString(uploadID) {
 		return ErrInvalidChunk
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	directory := filepath.Join(s.Root, uploadID)
-	if _, err := os.Stat(directory); err != nil {
-		return err
-	}
-	return atomicWrite(filepath.Join(directory, ".submitted"), []byte("1"), 0o600)
+	return atomicWrite(s.submittedPath(uploadID), []byte("1"), 0o600)
 }
 
-// Complete removes a merged upload only after its raw archive was persisted.
+// Complete removes a merged upload's chunks only after its raw archive was
+// persisted. The submitted record is kept until SubmittedRetention expires.
 func (s *ChunkStore) Complete(uploadID string) error {
 	if !validTaskID.MatchString(uploadID) {
 		return ErrInvalidChunk
@@ -295,6 +468,57 @@ func (s *ChunkStore) Complete(uploadID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return os.RemoveAll(filepath.Join(s.Root, uploadID))
+}
+
+// PruneStale removes incomplete uploads idle for longer than StaleUploadAge
+// and submitted records older than SubmittedRetention.
+func (s *ChunkStore) PruneStale(now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pruneLocked(now)
+}
+
+func (s *ChunkStore) pruneLocked(now time.Time) error {
+	s.lastPrune = now
+	var errorsSeen []error
+	entries, err := os.ReadDir(s.Root)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || !validTaskID.MatchString(entry.Name()) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if now.Sub(info.ModTime()) > StaleUploadAge {
+			if err := os.RemoveAll(filepath.Join(s.Root, entry.Name())); err != nil {
+				errorsSeen = append(errorsSeen, err)
+			}
+		}
+	}
+	markers, err := os.ReadDir(filepath.Join(s.Root, submittedDirName))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		errorsSeen = append(errorsSeen, err)
+	}
+	for _, marker := range markers {
+		info, err := marker.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		if now.Sub(info.ModTime()) > SubmittedRetention {
+			if err := os.Remove(filepath.Join(s.Root, submittedDirName, marker.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+				errorsSeen = append(errorsSeen, err)
+			}
+		}
+	}
+	return errors.Join(errorsSeen...)
+}
+
+func (s *ChunkStore) submittedPath(uploadID string) string {
+	return filepath.Join(s.Root, submittedDirName, uploadID)
 }
 
 func chunkSize(directory string) (int64, error) {

@@ -170,14 +170,68 @@ func (s *AsyncSubmitter) Submit(_ context.Context, data []byte, userID, taskID s
 	return nil
 }
 
+// Recover queues archives that a previous process accepted but did not finish
+// processing, oldest first. Call it once at startup before serving requests.
+func (s *AsyncSubmitter) Recover() (int, error) {
+	if s.Store == nil || s.Processor == nil {
+		return 0, fmt.Errorf("submitter is not configured")
+	}
+	pending, err := s.Store.PendingRaw()
+	if err != nil {
+		return 0, err
+	}
+	s.startWorkers()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return 0, ErrSubmitterClosed
+	}
+	queued := make(map[string]struct{}, len(s.pending))
+	for _, job := range s.pending {
+		queued[job.path] = struct{}{}
+	}
+	recovered := 0
+	for _, archive := range pending {
+		if _, exists := queued[archive.Path]; exists {
+			continue
+		}
+		s.pending = append(s.pending, queuedJob{path: archive.Path, userID: archive.UserID, taskID: archive.TaskID})
+		recovered++
+	}
+	if recovered > 0 {
+		s.ready.Broadcast()
+		if s.Logf != nil {
+			s.Logf("[QUEUE] recovered %d unprocessed archive(s) from a previous run", recovered)
+		}
+	}
+	return recovered, nil
+}
+
 // Close stops accepting work and waits for already accepted jobs to finish.
 func (s *AsyncSubmitter) Close() {
+	_ = s.CloseContext(context.Background())
+}
+
+// CloseContext stops accepting work and waits for accepted jobs until ctx is
+// done. Jobs that have not finished by then stay in the store's pending
+// directory and are picked up by Recover on the next start.
+func (s *AsyncSubmitter) CloseContext(ctx context.Context) error {
 	s.startWorkers()
 	s.mu.Lock()
 	s.closed = true
 	s.ready.Broadcast()
 	s.mu.Unlock()
-	s.workersWG.Wait()
+	done := make(chan struct{})
+	go func() {
+		s.workersWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (s *AsyncSubmitter) startWorkers() {
@@ -221,12 +275,27 @@ func (s *AsyncSubmitter) nextJob() (queuedJob, bool) {
 }
 
 func (s *AsyncSubmitter) processJob(job queuedJob) {
-	defer func() {
-		if recovered := recover(); recovered != nil && s.Logf != nil {
-			s.Logf("[ERROR] processing panicked task=%s", job.taskID)
-		}
-	}()
-	if err := s.Processor.Process(context.Background(), job.path, job.userID, job.taskID); err != nil && s.Logf != nil {
+	err := s.runProcessor(job)
+	if err != nil && !errors.Is(err, errProcessorPanicked) && s.Logf != nil {
 		s.Logf("[ERROR] processing failed task=%s: %v", job.taskID, err)
 	}
+	// Move the archive out of the pending directory either way, so it is not
+	// recovered again and a failing archive cannot accumulate without bound.
+	if finishErr := s.Store.FinishRaw(job.path, err == nil); finishErr != nil && s.Logf != nil {
+		s.Logf("[ERROR] could not finalize raw archive task=%s: %v", job.taskID, finishErr)
+	}
+}
+
+var errProcessorPanicked = errors.New("processing panicked")
+
+func (s *AsyncSubmitter) runProcessor(job queuedJob) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = errProcessorPanicked
+			if s.Logf != nil {
+				s.Logf("[ERROR] processing panicked task=%s", job.taskID)
+			}
+		}
+	}()
+	return s.Processor.Process(context.Background(), job.path, job.userID, job.taskID)
 }
